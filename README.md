@@ -66,7 +66,7 @@ The frontend runs on Vite, and `/api` requests are proxied to the Express backen
 
 ## Screenshot
 
-Add screenshot here.
+![Project Screenshot](image.png)
 
 ## Retrieval Pipeline
 
@@ -128,19 +128,3 @@ VITE_APP_TITLE=RAG Pipeline
 ```
 
 The API key is used only by the backend proxy. The browser never calls Groq directly.
-
-## Roadmap
-
-- Add cross-encoder re-ranking for better final chunk ordering
-- Add persistent document and vector storage
-- Support authenticated user workspaces
-- Add multi-modal document support
-- Add exportable chat sessions and citation reports
-
-## Contributing
-
-Issues and pull requests are welcome. Keep changes focused, include verification steps, and avoid mixing unrelated refactors with feature work.
-
-## License
-
-MIT
