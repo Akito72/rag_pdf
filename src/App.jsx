@@ -1,19 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { env, pipeline } from "@xenova/transformers";
-import * as pdfjsLib from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-env.allowLocalModels = false;
-env.useBrowserCache = true;
+import { chatWithAgent, deleteDocument, uploadDocument } from "./api";
 
 const APP_TITLE = import.meta.env.VITE_APP_TITLE || "RAG Pipeline";
-const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
-const RRF_K = 60;
 const MODEL_OPTIONS = [
   { value: "llama-3.3-70b-versatile", label: "llama-3.3-70b-versatile", note: "Best quality" },
   { value: "llama-3.1-8b-instant", label: "llama-3.1-8b-instant", note: "Fastest" },
-  { value: "mixtral-8x7b-32768", label: "mixtral-8x7b-32768", note: "Large context" },
+  { value: "mixtral-8x7b-32768", label: "mixtral-8x7b-32768", note: "High context" },
 ];
 
 const STYLES = `
@@ -111,250 +103,35 @@ const STYLES = `
   ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
 `;
 
-function chunkText(text, chunkSize = 400, overlap = 80) {
-  const words = text.split(/\s+/);
-  const chunks = [];
-  let i = 0;
-  while (i < words.length) {
-    const chunk = words.slice(i, i + chunkSize).join(" ");
-    if (chunk.trim()) chunks.push(chunk);
-    i += chunkSize - overlap;
-  }
-  return chunks;
-}
-
-function tokenize(text) {
-  return text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
-}
-
-function bm25Score(query, doc, avgDocLen, docFreqs, N, k1 = 1.5, b = 0.75) {
-  const qTerms = tokenize(query);
-  const docTerms = tokenize(doc);
-  const docLen = docTerms.length || 1;
-  const termFreq = {};
-  docTerms.forEach((term) => {
-    termFreq[term] = (termFreq[term] || 0) + 1;
-  });
-
-  return qTerms.reduce((score, term) => {
-    const df = docFreqs[term] || 0;
-    if (df === 0) return score;
-    const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1);
-    const tf = termFreq[term] || 0;
-    const numerator = tf * (k1 + 1);
-    const denominator = tf + k1 * (1 - b + b * (docLen / avgDocLen));
-    return score + idf * (numerator / denominator);
-  }, 0);
-}
-
-function buildBM25Index(chunks) {
-  const N = chunks.length;
-  const avgDocLen = chunks.reduce((sum, chunk) => sum + tokenize(chunk).length, 0) / Math.max(N, 1);
-  const docFreqs = {};
-  chunks.forEach((chunk) => {
-    new Set(tokenize(chunk)).forEach((term) => {
-      docFreqs[term] = (docFreqs[term] || 0) + 1;
-    });
-  });
-  return { N, avgDocLen: avgDocLen || 1, docFreqs };
-}
-
-function cosineSimilarity(a, b) {
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  if (!normA || !normB) return 0;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-function rrfFuse(rankings, limit, k = RRF_K) {
-  const fused = new Map();
-  rankings.forEach((ranking) => {
-    ranking.forEach((item, rank) => {
-      const current = fused.get(item.i) || { ...item, score: 0 };
-      fused.set(item.i, {
-        ...current,
-        ...item,
-        score: current.score + 1 / (k + rank + 1),
-      });
-    });
-  });
-  return [...fused.values()].sort((a, b) => b.score - a.score).slice(0, limit);
-}
-
-function retrieveHybridChunks(query, queryEmbedding, doc, topK) {
-  const { N, avgDocLen, docFreqs } = doc.index;
-  const bm25Ranking = doc.chunks
-    .map((chunk, i) => ({
-      i,
-      text: chunk,
-      source: doc.name,
-      bm25Score: bm25Score(query, chunk, avgDocLen, docFreqs, N),
-    }))
-    .sort((a, b) => b.bm25Score - a.bm25Score);
-
-  const denseRanking = doc.chunks
-    .map((chunk, i) => ({
-      i,
-      text: chunk,
-      source: doc.name,
-      denseScore: cosineSimilarity(queryEmbedding, doc.embeddings[i]),
-    }))
-    .sort((a, b) => b.denseScore - a.denseScore);
-
-  return rrfFuse([bm25Ranking, denseRanking], topK);
-}
-
-async function extractPdfText(file) {
-  const buffer = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
-  const pages = [];
-
-  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum += 1) {
-    const page = await pdf.getPage(pageNum);
-    const content = await page.getTextContent();
-    pages.push(content.items.map((item) => item.str).join(" "));
-  }
-
-  return pages.join("\n\n").replace(/\s+/g, " ").trim();
-}
-
-function parseCitations(raw, topChunks) {
-  const citMatch = raw.match(/CITATIONS_JSON:\s*(\[[\s\S]*?\])/);
-  let citations = [];
-
-  if (citMatch) {
-    try {
-      citations = JSON.parse(citMatch[1]).map((citation) => {
-        const chunk = topChunks[citation.num - 1];
-        return {
-          ...citation,
-          source: citation.source || chunk?.source,
-          text: citation.text || (chunk ? `${chunk.text.slice(0, 200)}...` : ""),
-        };
-      });
-    } catch {
-      citations = [];
-    }
-  }
-
-  if (citations.length === 0) {
-    const usedNums = [...new Set([...raw.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1])))];
-    citations = usedNums
-      .map((num) => {
-        const chunk = topChunks[num - 1];
-        return chunk ? { num, source: chunk.source, text: `${chunk.text.slice(0, 200)}...` } : null;
-      })
-      .filter(Boolean);
-  }
-
-  return citations;
-}
-
-async function readChatStream(response, onText) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let fullText = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split("\n\n");
-    buffer = events.pop() || "";
-
-    for (const event of events) {
-      const dataLine = event.split("\n").find((line) => line.startsWith("data: "));
-      if (!dataLine) continue;
-
-      const data = dataLine.slice(6);
-      if (data === "[DONE]") continue;
-
-      const parsed = JSON.parse(data);
-      if (parsed.type === "content_block_delta" && parsed.delta?.type === "text_delta") {
-        fullText += parsed.delta.text;
-        onText(parsed.delta.text);
-      }
-    }
-  }
-
-  return fullText;
-}
 
 export default function RAGPipeline() {
   const [docs, setDocs] = useState([]);
   const [topK, setTopK] = useState(5);
-  const [chunkSize, setChunkSize] = useState(400);
+  const [chunkSize] = useState(400); // chunking now happens server-side; kept for display only
   const [selectedModel, setSelectedModel] = useState("llama-3.3-70b-versatile");
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [processing, setProcessing] = useState(null);
-  const [embeddingStatus, setEmbeddingStatus] = useState("");
+  const [agentStatus, setAgentStatus] = useState("");
   const fileInputRef = useRef(null);
   const chatRef = useRef(null);
-  const embeddingModelRef = useRef(null);
-  const vectorStoreRef = useRef(new Map());
 
-  const totalChunks = docs.reduce((sum, doc) => sum + doc.chunks.length, 0);
+  const totalChunks = docs.reduce((sum, doc) => sum + doc.chunks, 0);
 
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [messages, loading, processing]);
 
-  const getEmbeddingModel = useCallback(async () => {
-    if (!embeddingModelRef.current) {
-      setEmbeddingStatus("Loading embedding model...");
-      embeddingModelRef.current = await pipeline("feature-extraction", EMBEDDING_MODEL);
-    }
-    return embeddingModelRef.current;
-  }, []);
-
-  const embedTexts = useCallback(async (texts, onProgress) => {
-    const extractor = await getEmbeddingModel();
-    const embeddings = [];
-
-    for (let i = 0; i < texts.length; i += 1) {
-      onProgress?.(i + 1, texts.length);
-      const output = await extractor(texts[i], { pooling: "mean", normalize: true });
-      embeddings.push(Array.from(output.data));
-    }
-
-    return embeddings;
-  }, [getEmbeddingModel]);
-
   const processFile = useCallback(async (file) => {
-    setProcessing({ name: file.name, stage: "Extracting text", done: 0, total: 0 });
-    setEmbeddingStatus("");
+    setProcessing({ name: file.name, stage: "Uploading & indexing (FAISS + BM25)" });
 
     try {
-      const text = file.type === "application/pdf" ? await extractPdfText(file) : await file.text();
-
-      if (!text || text.trim().length < 50) {
-        throw new Error("Could not extract sufficient text from file.");
-      }
-
-      const chunks = chunkText(text, chunkSize, Math.floor(chunkSize * 0.2));
-      const index = buildBM25Index(chunks);
-
-      setProcessing({ name: file.name, stage: "Embedding chunks", done: 0, total: chunks.length });
-      const embeddings = await embedTexts(chunks, (done, total) => {
-        setProcessing({ name: file.name, stage: "Embedding chunks", done, total });
-        setEmbeddingStatus(`Embedding ${done}/${total}`);
-      });
-
-      vectorStoreRef.current.set(file.name, { chunks, embeddings });
+      const result = await uploadDocument(file);
       setDocs((prev) => {
         const filtered = prev.filter((doc) => doc.name !== file.name);
-        return [...filtered, { name: file.name, chunks, index, embeddings, size: file.size }];
+        return [...filtered, { name: file.name, chunks: result.chunks, size: result.size }];
       });
     } catch (error) {
       setMessages((prev) => [...prev, {
@@ -363,9 +140,8 @@ export default function RAGPipeline() {
       }]);
     } finally {
       setProcessing(null);
-      setEmbeddingStatus("");
     }
-  }, [chunkSize, embedTexts]);
+  }, []);
 
   const handleFiles = useCallback(async (files) => {
     for (const file of Array.from(files)) {
@@ -383,9 +159,16 @@ export default function RAGPipeline() {
     handleFiles(event.dataTransfer.files);
   }, [handleFiles]);
 
-  const removeDoc = (name) => {
-    vectorStoreRef.current.delete(name);
+  const removeDoc = async (name) => {
     setDocs((prev) => prev.filter((doc) => doc.name !== name));
+    try {
+      await deleteDocument(name);
+    } catch (error) {
+      setMessages((prev) => [...prev, {
+        role: "error",
+        content: `Failed to remove "${name}": ${error.message}`,
+      }]);
+    }
   };
 
   const handleSend = async () => {
@@ -411,73 +194,34 @@ export default function RAGPipeline() {
     ]);
 
     try {
-      setEmbeddingStatus("Embedding query...");
-      const [queryEmbedding] = await embedTexts([q]);
-      setEmbeddingStatus("");
-
-      const allRetrieved = docs.flatMap((doc) => retrieveHybridChunks(q, queryEmbedding, doc, topK));
-      const topChunks = allRetrieved.sort((a, b) => b.score - a.score).slice(0, topK);
-
-      const contextBlock = topChunks.map((chunk, i) =>
-        `[SOURCE ${i + 1} | ${chunk.source}]\n${chunk.text}`
-      ).join("\n\n---\n\n");
+      setAgentStatus("Agent is reasoning and searching documents...");
 
       const history = historySource
         .filter((message) => message.role === "user" || message.role === "assistant")
         .slice(-8)
         .map((message) => ({ role: message.role, content: message.content }));
 
-      const systemPrompt = `You are an expert research assistant with access to retrieved document excerpts.
-
-RETRIEVED CONTEXT:
-${contextBlock}
-
-INSTRUCTIONS:
-- Answer based ONLY on the retrieved context above.
-- When you use information from a source, mark it inline like: [1], [2], etc., matching the SOURCE numbers above.
-- Be precise, analytical, and thorough.
-- If the context doesn't contain enough information, say so explicitly.
-- Return your answer as plain text with [N] citation markers inline. After your answer, output a JSON block on a new line:
-  CITATIONS_JSON: [{"num": 1, "source": "...", "text": "..."}, ...]
-  Include only the citations you actually used.`;
-
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: selectedModel,
-          max_tokens: 1000,
-          system: systemPrompt,
-          messages: [...history, { role: "user", content: q }],
-        }),
-      });
-
-      if (!response.ok) {
-        const contentType = response.headers.get("content-type") || "";
-        const errorPayload = contentType.includes("application/json") ? await response.json() : await response.text();
-        throw new Error(errorPayload.error || errorPayload);
-      }
-
-      const raw = await readChatStream(response, (token) => {
-        setMessages((prev) => prev.map((message) =>
-          message.id === assistantId ? { ...message, content: message.content + token } : message
-        ));
-      });
-
-      const citations = parseCitations(raw, topChunks);
-      const answerText = raw.replace(/\n?CITATIONS_JSON:[\s\S]*$/, "").trim();
-
-      setMessages((prev) => prev.map((message) =>
-        message.id === assistantId
-          ? { ...message, content: answerText, citations, retrievedChunks: topChunks }
-          : message
-      ));
+      await chatWithAgent(
+        { question: q, history, model: selectedModel, topK, maxTokens: 1000 },
+        (result) => {
+          setMessages((prev) => prev.map((message) =>
+            message.id === assistantId
+              ? {
+                  ...message,
+                  content: result.answer,
+                  citations: result.citations || [],
+                  retrievedChunks: result.retrieved_chunks || [],
+                }
+              : message
+          ));
+        }
+      );
     } catch (error) {
       setMessages((prev) => prev
         .filter((message) => message.id !== assistantId)
         .concat({ role: "error", content: `API error: ${error.message}` }));
     } finally {
-      setEmbeddingStatus("");
+      setAgentStatus("");
       setLoading(false);
     }
   };
@@ -505,9 +249,7 @@ INSTRUCTIONS:
   }
 
   const isEmpty = messages.length === 0 && !loading;
-  const busyLabel = processing
-    ? `${processing.stage} ${processing.name}${processing.total ? ` (${processing.done}/${processing.total})` : ""}`
-    : embeddingStatus;
+  const busyLabel = processing ? `${processing.stage}: ${processing.name}` : agentStatus;
 
   return (
     <>
@@ -516,7 +258,7 @@ INSTRUCTIONS:
         <header className="header">
           <h1 className="header-title">{APP_TITLE}</h1>
           <span className="header-badge">Hybrid RAG</span>
-          <span className="header-sub">BM25 + MiniLM + citation grounding</span>
+          <span className="header-sub">FAISS + BM25 + LangChain ReAct agent</span>
         </header>
 
         <div className="layout">
@@ -559,7 +301,7 @@ INSTRUCTIONS:
                   <div key={doc.name} className="doc-item">
                     <span style={{ fontSize: "0.9rem" }}>#</span>
                     <span className="doc-item-name" title={doc.name}>{doc.name}</span>
-                    <span className="doc-item-chunks">{doc.chunks.length}c</span>
+                    <span className="doc-item-chunks">{doc.chunks}c</span>
                     <button className="doc-remove" onClick={() => removeDoc(doc.name)}>x</button>
                   </div>
                 ))}
@@ -582,10 +324,8 @@ INSTRUCTIONS:
               <div className="section-label">Retrieval Config</div>
               <div className="config-row"><span>Top-K chunks</span><span className="config-val">{topK}</span></div>
               <input type="range" min={1} max={10} value={topK} onChange={(event) => setTopK(Number(event.target.value))} className="slider" />
-              <div className="config-row" style={{ marginTop: 10 }}><span>Chunk size (words)</span><span className="config-val">{chunkSize}</span></div>
-              <input type="range" min={100} max={800} step={50} value={chunkSize} onChange={(event) => setChunkSize(Number(event.target.value))} className="slider" />
               <div style={{ fontSize: "0.6rem", color: "var(--text-dim)", marginTop: 6, lineHeight: 1.6 }}>
-                Overlap: {Math.floor(chunkSize * 0.2)} words. RRF k={RRF_K}.
+                Chunking (400 words, 20% overlap), FAISS indexing, and BM25 indexing all run server-side on upload.
               </div>
             </div>
 
@@ -616,10 +356,11 @@ INSTRUCTIONS:
             <div>
               <div className="section-label">Method</div>
               <div style={{ fontSize: "0.65rem", color: "var(--text-dim)", lineHeight: 1.8 }}>
-                BM25 lexical retrieval<br />
-                MiniLM dense embeddings<br />
-                Per-session vector cache<br />
-                Streaming Llama 3.3 70B responses
+                FAISS dense + BM25 lexical retrieval<br />
+                Reciprocal Rank Fusion<br />
+                LangChain ReAct agent<br />
+                Per-session vector-store isolation<br />
+                FastAPI backend
               </div>
             </div>
           </aside>

@@ -2,129 +2,111 @@
 
 ![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=111)
 ![Vite](https://img.shields.io/badge/Vite-8-646CFF?logo=vite&logoColor=fff)
+![FastAPI](https://img.shields.io/badge/FastAPI-Python-009688?logo=fastapi&logoColor=fff)
+![FAISS](https://img.shields.io/badge/FAISS-Meta-3776AB)
+![LangChain](https://img.shields.io/badge/LangChain-ReAct_Agent-1C3C3C)
 ![Groq](https://img.shields.io/badge/Groq-API-F55036)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-A full-stack Retrieval-Augmented Generation app for asking questions over uploaded documents.
-Hybrid retrieval runs in the browser, while the Express backend keeps Groq API calls off the client.
+A full-stack, agentic Retrieval-Augmented Generation app for asking questions over uploaded documents.
+A LangChain ReAct agent decides when and how to search a per-session FAISS + BM25 hybrid index,
+then answers with inline, verifiable citations.
 
 ## How It Works
 
 ```mermaid
 flowchart LR
-  A[Upload .txt / .md / .pdf] --> B[Extract text]
+  A[Upload .txt / .md / .pdf] --> B[FastAPI: extract text]
   B --> C[Chunk text with overlap]
   C --> D[Build BM25 index]
-  C --> E[Encode chunks with MiniLM WASM]
-  F[User question] --> G[BM25 score + dense cosine score]
-  G --> H[RRF hybrid fusion]
-  H --> I[Top-K source chunks]
-  I --> J[Express /api/chat proxy]
-  J --> K[Groq llama-3.3-70b-versatile]
-  K --> L[Answer with citation markers]
+  C --> E[Embed chunks - sentence-transformers]
+  E --> F[FAISS index]
+  G[User question] --> H[LangChain ReAct agent]
+  H -- search_documents tool --> D
+  H -- search_documents tool --> F
+  D --> I[RRF hybrid fusion]
+  F --> I
+  I --> H
+  H --> J[Groq LLM]
+  J --> K[Answer with citation markers]
 ```
+
+## Architecture
+
+| Layer | Technology |
+| --- | --- |
+| Frontend | React 18, Vite |
+| Backend | **FastAPI** (Python) |
+| Agent orchestration | **LangChain ReAct agent** (`langchain-groq`) |
+| Dense retrieval | **FAISS** (`IndexFlatIP`) over `sentence-transformers` embeddings |
+| Lexical retrieval | **BM25** (`rank-bm25`) |
+| Hybrid fusion | Reciprocal Rank Fusion (RRF) |
+| PDF parsing | `pypdf` |
+| LLM | Groq API |
+| Session isolation | Per-session FAISS + BM25 indices, keyed by `X-Session-Id` header |
+
+See [`backend/README.md`](backend/README.md) for backend setup and API details.
 
 ## Features
 
-- Drag-and-drop upload for `.txt`, `.md`, and `.pdf`
-- PDF text extraction with `pdfjs-dist`
-- Configurable chunk size with 20% overlap
-- Pure JavaScript BM25 retrieval with `k1=1.5`, `b=0.75`
-- In-browser dense embeddings with `@xenova/transformers`
-- Hybrid retrieval using Reciprocal Rank Fusion
+- Drag-and-drop upload for `.txt`, `.md`, and `.pdf`, indexed server-side
+- FAISS dense retrieval + BM25 lexical retrieval, fused with Reciprocal Rank Fusion
+- A LangChain ReAct agent that can issue multiple searches per turn before answering
+- Inline `[N]` citation markers backed by the exact chunks the agent retrieved
+- Multi-turn conversation memory
+- Per-session vector-store isolation (no cross-user document leakage), with idle-session eviction
 - Configurable Top-K retrieval slider
-- Inline citation markers like `[1]` and `[2]`
-- Citation cards showing the source chunk used
-- Multi-turn conversation memory using the last 4 turns
-- Streaming-style response rendering from the local proxy
-- Per-session vector store with cached document embeddings
-- Live index stats for docs, chunks, chunk size, and Top-K
+- Streaming response delivery over SSE
 
 ## Getting Started
 
+### Backend (FastAPI + FAISS + LangChain)
+
 ```bash
-git clone <your-repo-url>
-cd my-rag
+cd backend
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# add your GROQ_API_KEY to backend/.env
+uvicorn app.main:app --reload --port 8000
+```
+
+### Frontend
+
+```bash
 npm install
 cp .env.example .env
-```
-
-Add your Groq API key to `.env`:
-
-```env
-GROQ_API_KEY=your_groq_api_key_here
-VITE_APP_TITLE=RAG Pipeline
-```
-
-Start the app:
-
-```bash
+# set VITE_API_BASE_URL if the backend isn't on localhost:8000
 npm run dev
 ```
-
-The frontend runs on Vite, and `/api` requests are proxied to the Express backend on port `3001`.
-
-## Screenshot
-
-![Project Screenshot](image.png)
-
-## Retrieval Pipeline
-
-The app retrieves context using both lexical and semantic matching. BM25 finds chunks that share important query terms, while MiniLM embeddings find chunks with similar meaning even when the wording differs. Reciprocal Rank Fusion combines both rankings so the final context is less dependent on one retrieval method.
 
 ## Configuration
 
 | Parameter | Default | Where | Description |
 | --- | ---: | --- | --- |
-| Chunk size | `400` words | UI slider | Number of words per chunk |
-| Overlap | `20%` | Derived from chunk size | Shared words between adjacent chunks |
-| Top-K | `5` | UI slider | Number of chunks sent to the LLM |
-| BM25 `k1` | `1.5` | Code | Term frequency saturation |
-| BM25 `b` | `0.75` | Code | Document length normalization |
-| Embedding model | `all-MiniLM-L6-v2` | Code | In-browser sentence transformer |
-| LLM model | `llama-3.3-70b-versatile` | UI selector | Groq chat model |
-
-## Tech Stack
-
-| Layer | Technology |
-| --- | --- |
-| Frontend | React 18, Vite |
-| Backend | Node.js, Express |
-| LLM | Groq API |
-| Default model | `llama-3.3-70b-versatile` |
-| Lexical retrieval | BM25 in JavaScript |
-| Dense retrieval | `@xenova/transformers`, `all-MiniLM-L6-v2` |
-| PDF parsing | `pdfjs-dist` |
-| Hybrid fusion | Reciprocal Rank Fusion |
-| Styling | CSS-in-JS, dark terminal aesthetic |
+| Chunk size | `400` words | Backend | Words per chunk, 20% overlap |
+| Top-K | `5` | UI slider | Chunks the agent's search tool returns per query |
+| Embedding model | `all-MiniLM-L6-v2` | Backend `.env` | `sentence-transformers` model for FAISS |
+| LLM model | `openai/gpt-oss-120b` | UI selector | Groq chat model used by the agent |
+| RRF `k` | `60` | Backend code | Reciprocal Rank Fusion constant |
 
 ## Project Structure
 
 ```text
 .
+|-- backend/
+|   |-- app/
+|   |   |-- main.py          # FastAPI routes
+|   |   |-- agent.py         # LangChain ReAct agent
+|   |   `-- vector_store.py  # FAISS + BM25 hybrid store, per-session isolation
+|   |-- requirements.txt
+|   `-- README.md
 |-- public/
-|   |-- favicon.svg
-|   `-- icons.svg
-|-- server/
-|   `-- index.js
 |-- src/
-|   |-- assets/
-|   |-- App.css
+|   |-- api.js               # FastAPI client
 |   |-- App.jsx
-|   |-- index.css
 |   `-- main.jsx
 |-- .env.example
-|-- eslint.config.js
-|-- index.html
 |-- package.json
 `-- vite.config.js
 ```
-
-## Environment
-
-```env
-GROQ_API_KEY=
-VITE_APP_TITLE=RAG Pipeline
-```
-
-The API key is used only by the backend proxy. The browser never calls Groq directly.
